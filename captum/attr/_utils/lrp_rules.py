@@ -21,6 +21,7 @@ class PropagationRule(ABC):
         inputs = _format_tensor_into_tuples(inputs)
         self._has_single_input = len(inputs) == 1
         self._handle_input_hooks = []
+        self.relevance_input = []
         for input in inputs:
             if not hasattr(input, "hook_registered"):
                 input_hook = self._create_backward_hook_input(input.data)
@@ -48,11 +49,10 @@ class PropagationRule(ABC):
     def _create_backward_hook_input(self, inputs):
         def _backward_hook_input(grad):
             relevance = grad * inputs
-            device = grad.device
             if self._has_single_input:
-                self.relevance_input[device] = relevance.data
+                self.relevance_input = relevance.data
             else:
-                self.relevance_input[device].append(relevance.data)
+                self.relevance_input.append(relevance.data)
             return relevance
 
         return _backward_hook_input
@@ -62,15 +62,14 @@ class PropagationRule(ABC):
             sign = torch.sign(outputs)
             sign[sign == 0] = 1
             relevance = grad / (outputs + sign * self.STABILITY_FACTOR)
-            self.relevance_output[grad.device] = grad.data
+            self.relevance_output = grad.data
             return relevance
 
         return _backward_hook_output
 
     def forward_hook_weights(self, module, inputs, outputs):
         """Save initial activations a_j before modules are changed"""
-        device = inputs[0].device if isinstance(inputs, tuple) else inputs.device
-        module.activations[device] = tuple(input.data for input in inputs)
+        module.activations = tuple(input.data for input in inputs)
         self._manipulate_weights(module, inputs, outputs)
 
     @abstractmethod
@@ -79,8 +78,7 @@ class PropagationRule(ABC):
 
     def forward_pre_hook_activations(self, module, inputs):
         """Pass initial activations to graph generation pass"""
-        device = inputs[0].device if isinstance(inputs, tuple) else inputs.device
-        for input, activation in zip(inputs, module.activations[device]):
+        for input, activation in zip(inputs, module.activations):
             input.data = activation
         return inputs
 
@@ -97,7 +95,7 @@ class EpsilonRule(PropagationRule):
         discriminator during propagation.
     """
 
-    def __init__(self, epsilon=1e-9) -> None:
+    def __init__(self, epsilon) -> None:
         self.STABILITY_FACTOR = epsilon
 
     def _manipulate_weights(self, module, inputs, outputs):
@@ -164,6 +162,6 @@ class IdentityRule(EpsilonRule):
 
     def _create_backward_hook_input(self, inputs):
         def _backward_hook_input(grad):
-            return self.relevance_output[grad.device]
+            return self.relevance_output
 
         return _backward_hook_input
