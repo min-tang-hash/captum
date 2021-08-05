@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-
 import typing
-from collections import defaultdict
-from typing import Any, List, Tuple, Union, cast
+import warnings
+from typing import Any, List, Tuple, Union
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import Module
 from torch.utils.hooks import RemovableHandle
 
-from captum._utils.common import _format_input, _format_output, _is_tuple, _run_forward
+from captum._utils.common import _format_input, _format_output, _run_forward
 from captum._utils.gradient import (
     apply_gradient_requirements,
     undo_gradient_requirements,
 )
 from captum._utils.typing import Literal, TargetType, TensorOrTupleOfTensorsGeneric
 from captum.attr._utils.attribution import GradientAttribution
-from captum.attr._utils.common import _sum_rows
 from captum.attr._utils.custom_modules import Addition_Module
-from captum.attr._utils.lrp_rules import EpsilonRule, PropagationRule
-from captum.log import log_usage
+from captum.attr._utils.lrp_rules import EpsilonRule, PropagationRule, GammaRule, Alpha1_Beta0_Rule, IdentityRule
 
 
 class LRP(GradientAttribution):
@@ -36,7 +34,7 @@ class LRP(GradientAttribution):
     Ancona et al. [https://openreview.net/forum?id=Sy21R9JAW].
     """
 
-    def __init__(self, model: Module) -> None:
+    def __init__(self, model: Module, rule = 0, epsilon = 1e-9) -> None:
         r"""
         Args:
 
@@ -47,7 +45,24 @@ class LRP(GradientAttribution):
                 is used.
         """
         GradientAttribution.__init__(self, model)
-        self.model = model
+        
+        if rule == 0:
+            self.rule = EpsilonRule
+            self.epsilon = epsilon
+        elif rule == 1:
+            self.rule = GammaRule
+        else:
+            self.rule = EpsilonRule
+
+        if isinstance(model, nn.DataParallel):
+            warnings.warn(
+                """Although input model is of type `nn.DataParallel` it will run
+                only on one device. Support for multiple devices will be added soon."""
+            )
+            self.model = model.module
+        else:
+            self.model = model
+
         self._check_rules()
 
     @property
@@ -77,7 +92,6 @@ class LRP(GradientAttribution):
     ) -> Tuple[TensorOrTupleOfTensorsGeneric, Tensor]:
         ...
 
-    @log_usage()
     def attribute(
         self,
         inputs: TensorOrTupleOfTensorsGeneric,
@@ -184,7 +198,7 @@ class LRP(GradientAttribution):
         self.backward_handles: List[RemovableHandle] = []
         self.forward_handles: List[RemovableHandle] = []
 
-        is_inputs_tuple = _is_tuple(inputs)
+        is_inputs_tuple = isinstance(inputs, tuple)
         inputs = _format_input(inputs)
         gradient_mask = apply_gradient_requirements(inputs)
 
@@ -200,8 +214,7 @@ class LRP(GradientAttribution):
                 self._forward_fn_wrapper, inputs, target, additional_forward_args
             )
             relevances = tuple(
-                normalized_relevance
-                * output.reshape((-1,) + (1,) * (normalized_relevance.dim() - 1))
+                normalized_relevance * output.unsqueeze(dim=1)
                 for normalized_relevance in normalized_relevances
             )
         finally:
@@ -210,9 +223,12 @@ class LRP(GradientAttribution):
         undo_gradient_requirements(inputs, gradient_mask)
 
         if return_convergence_delta:
-            return (
-                _format_output(is_inputs_tuple, relevances),
-                self.compute_convergence_delta(relevances, output),
+            delta = []
+            for relevance in relevances:
+                delta.append(self.compute_convergence_delta(relevance, output))
+            return (  # type: ignore
+                _format_output(is_inputs_tuple, relevances),  # type: ignore
+                _format_output(is_inputs_tuple, tuple(delta)),
             )
         else:
             return _format_output(is_inputs_tuple, relevances)  # type: ignore
@@ -249,14 +265,19 @@ class LRP(GradientAttribution):
             *tensor*:
             - **delta** Difference of relevance in output layer and input layer.
         """
+
+        def _attribution_delta(attributions: Tensor, output: Tensor) -> Tensor:
+            remaining_dims = tuple(range(1, len(attributions.shape)))
+            sum_attributions = torch.sum(attributions, dim=remaining_dims)
+            delta = output - sum_attributions
+            return delta
+
         if isinstance(attributions, tuple):
-            for attr in attributions:
-                summed_attr = cast(
-                    Tensor, sum(_sum_rows(attr) for attr in attributions)
-                )
+            stacked_attributions = torch.stack(attributions, dim=1)
+            delta = _attribution_delta(stacked_attributions, output)
         else:
-            summed_attr = _sum_rows(attributions)
-        return output.flatten() - summed_attr.flatten()
+            delta = _attribution_delta(attributions, output)
+        return delta
 
     def _get_layers(self, model: Module) -> None:
         for layer in model.children():
@@ -268,24 +289,26 @@ class LRP(GradientAttribution):
     def _check_and_attach_rules(self) -> None:
         for layer in self.layers:
             if hasattr(layer, "rule"):
-                layer.activations = {}  # type: ignore
-                layer.rule.relevance_input = defaultdict(list)  # type: ignore
-                layer.rule.relevance_output = {}  # type: ignore
                 pass
             elif type(layer) in SUPPORTED_LAYERS_WITH_RULES.keys():
-                layer.activations = {}  # type: ignore
-                layer.rule = SUPPORTED_LAYERS_WITH_RULES[type(layer)]()  # type: ignore
-                layer.rule.relevance_input = defaultdict(list)  # type: ignore
-                layer.rule.relevance_output = {}  # type: ignore
+                #layer.rule = SUPPORTED_LAYERS_WITH_RULES[type(layer)]()  # type: ignore
+                #layer.rule = GammaRule()
+                if self.rule == EpsilonRule:
+                    layer.rule=self.rule(epsilon = self.epsilon)
+                elif self.rule == GammaRule:
+                    layer.rule=self.rule()
+                else:
+                    layer.rule=self.rule()
             elif type(layer) in SUPPORTED_NON_LINEAR_LAYERS:
                 layer.rule = None  # type: ignore
             else:
-                raise TypeError(
-                    (
-                        f"Module type {type(layer)} is not supported."
-                        "No default rule defined."
-                    )
-                )
+                layer.rule=self.rule()
+#                 raise TypeError(
+#                     (
+#                         f"Module type {type(layer)} is not supported."
+#                         "No default rule defined."
+#                     )
+#                 )
 
     def _check_rules(self) -> None:
         for module in self.model.modules():
@@ -391,9 +414,7 @@ class LRP(GradientAttribution):
 
         #TODO: Remove when bugs are fixed
         """
-        adjusted_inputs = tuple(
-            input + 0 if input is not None else input for input in inputs
-        )
+        adjusted_inputs = tuple(input + 0 for input in inputs)
         return self.model(*adjusted_inputs)
 
 
@@ -406,7 +427,8 @@ SUPPORTED_LAYERS_WITH_RULES = {
     nn.AdaptiveAvgPool2d: EpsilonRule,
     nn.Linear: EpsilonRule,
     nn.BatchNorm2d: EpsilonRule,
+    nn.Conv1d: EpsilonRule,
     Addition_Module: EpsilonRule,
 }
 
-SUPPORTED_NON_LINEAR_LAYERS = [nn.ReLU, nn.Dropout, nn.Tanh]
+SUPPORTED_NON_LINEAR_LAYERS = [nn.ReLU, nn.functional.softplus, nn.Dropout, nn.Tanh]
